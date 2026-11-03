@@ -625,17 +625,3 @@ app.delete("/borrows/:id", verifyToken, async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Simple CRUD server is running on port ${PORT}`);
 });
-
-
-
-
-
-<>
-    <h2>1</h2>
-    <h2>2</h2>
-    <h2>3</h2>
-    <h2>4</h2>
-    <h2>5</h2>
-    <h2>6</h2>
-    <h2>7</h2>
-</>
