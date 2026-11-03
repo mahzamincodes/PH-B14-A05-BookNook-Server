@@ -8,13 +8,38 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Environment validation
+const AUTH_URL = process.env.BETTER_AUTH_URL;
+
+if (!AUTH_URL) {
+    throw new Error("BETTER_AUTH_URL is missing from environment variables");
+}
+
+if (!process.env.DB_USER || !process.env.DB_PASS) {
+    throw new Error("MongoDB credentials are missing from environment variables");
+}
+
+const allowedOrigins = process.env.CLIENT_URL
+    ? process.env.CLIENT_URL.split(",").map((url) => url.trim())
+    : ["http://localhost:3000"];
+
 // Middleware
-app.use(cors());
+app.use(
+    cors({
+        origin: (origin, callback) => {
+            // Allow requests without an Origin header, such as Postman.
+            if (!origin || allowedOrigins.includes(origin)) {
+                return callback(null, true);
+            }
+
+            return callback(new Error("Not allowed by CORS"));
+        },
+    }),
+);
+
 app.use(express.json());
 
 // Better Auth JWT verification
-const AUTH_URL = process.env.BETTER_AUTH_URL;
-
 const JWKS = createRemoteJWKSet(
     new URL("/api/auth/jwks", AUTH_URL),
 );
@@ -75,23 +100,14 @@ const upload = multer({
 
 // MongoDB connection
 const client = new MongoClient(
-    `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.vznqwwk.mongodb.net/`,
+    `mongodb+srv://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASS)}@cluster0.vznqwwk.mongodb.net/`,
 );
 
-async function connectToMongoDB() {
-    try {
-        await client.connect();
-        console.log("You successfully connected to MongoDB!");
-        return client;
-    } catch (error) {
-        console.error("MongoDB connection failed:", error);
-        throw error;
-    }
-}
+await client.connect();
 
-const connectedClient = await connectToMongoDB();
+console.log("You successfully connected to MongoDB!");
 
-const db = connectedClient.db("booknook");
+const db = client.db("booknook");
 const books = db.collection("books");
 const borrows = db.collection("borrows");
 
@@ -100,6 +116,13 @@ await borrows.createIndex(
     { bookId: 1, borrowerEmail: 1 },
     { unique: true },
 );
+
+// Custom error helper
+const createError = (message, statusCode = 400) => {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
+};
 
 // Root route
 app.get("/", (req, res) => {
@@ -116,6 +139,12 @@ app.post(
             if (!req.file) {
                 return res.status(400).send({
                     message: "Please select an image",
+                });
+            }
+
+            if (!process.env.IMGBB_API_KEY) {
+                return res.status(500).send({
+                    message: "Image upload service is not configured",
                 });
             }
 
@@ -145,9 +174,10 @@ app.post(
                 imageUrl: result.data.url,
             });
         } catch (error) {
+            console.error("Image upload error:", error);
+
             res.status(500).send({
                 message: "Failed to upload image",
-                error: error.message,
             });
         }
     },
@@ -166,16 +196,17 @@ app.get("/books", async (req, res) => {
         });
 
         if (Number.isInteger(limit) && limit > 0) {
-            cursor.limit(limit);
+            cursor.limit(Math.min(limit, 100));
         }
 
         const allBooks = await cursor.toArray();
 
         res.status(200).send(allBooks);
     } catch (error) {
+        console.error("Get books error:", error);
+
         res.status(500).send({
             message: "Failed to get books",
-            error: error.message,
         });
     }
 });
@@ -203,9 +234,10 @@ app.get("/books/:id", verifyToken, async (req, res) => {
 
         res.status(200).send(book);
     } catch (error) {
+        console.error("Get single book error:", error);
+
         res.status(500).send({
             message: "Failed to get book",
-            error: error.message,
         });
     }
 });
@@ -222,9 +254,32 @@ app.post("/books", verifyToken, async (req, res) => {
             image,
         } = req.body;
 
-        if (!title || !author || !category || !description) {
+        if (
+            typeof title !== "string" ||
+            !title.trim() ||
+            typeof author !== "string" ||
+            !author.trim() ||
+            typeof category !== "string" ||
+            !category.trim() ||
+            typeof description !== "string" ||
+            !description.trim()
+        ) {
             return res.status(400).send({
                 message: "Please provide all required fields",
+            });
+        }
+
+        const allowedCategories = [
+            "Fiction",
+            "Science",
+            "History",
+            "Kids",
+            "Others",
+        ];
+
+        if (!allowedCategories.includes(category)) {
+            return res.status(400).send({
+                message: "Invalid book category",
             });
         }
 
@@ -240,11 +295,17 @@ app.post("/books", verifyToken, async (req, res) => {
             });
         }
 
+        if (image !== undefined && typeof image !== "string") {
+            return res.status(400).send({
+                message: "Invalid image URL",
+            });
+        }
+
         const newBook = {
             title: title.trim(),
             author: author.trim(),
             category,
-            description,
+            description: description.trim(),
             totalCopies: copies,
             availableCopies: copies,
             image: image || "",
@@ -262,9 +323,10 @@ app.post("/books", verifyToken, async (req, res) => {
             insertedId: result.insertedId,
         });
     } catch (error) {
+        console.error("Add book error:", error);
+
         res.status(500).send({
             message: "Failed to add book",
-            error: error.message,
         });
     }
 });
@@ -316,6 +378,7 @@ app.patch("/books/:id", verifyToken, async (req, res) => {
                     message: "Book title cannot be empty",
                 });
             }
+
             updateFields.title = title.trim();
         }
 
@@ -325,16 +388,26 @@ app.patch("/books/:id", verifyToken, async (req, res) => {
                     message: "Author name cannot be empty",
                 });
             }
+
             updateFields.author = author.trim();
         }
 
         if (category !== undefined) {
-            if (typeof category !== "string" || !category.trim()) {
+            const allowedCategories = [
+                "Fiction",
+                "Science",
+                "History",
+                "Kids",
+                "Others",
+            ];
+
+            if (!allowedCategories.includes(category)) {
                 return res.status(400).send({
-                    message: "Category cannot be empty",
+                    message: "Invalid book category",
                 });
             }
-            updateFields.category = category.trim();
+
+            updateFields.category = category;
         }
 
         if (description !== undefined) {
@@ -346,6 +419,7 @@ app.patch("/books/:id", verifyToken, async (req, res) => {
                     message: "Description cannot be empty",
                 });
             }
+
             updateFields.description = description.trim();
         }
 
@@ -355,6 +429,7 @@ app.patch("/books/:id", verifyToken, async (req, res) => {
                     message: "Invalid image URL",
                 });
             }
+
             updateFields.image = image;
         }
 
@@ -394,23 +469,35 @@ app.patch("/books/:id", verifyToken, async (req, res) => {
         updateFields.updatedAt = new Date();
 
         const result = await books.updateOne(
-            { _id: new ObjectId(id) },
-            { $set: updateFields },
+            {
+                _id: new ObjectId(id),
+                "addedBy.email": req.user.email,
+            },
+            {
+                $set: updateFields,
+            },
         );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).send({
+                message: "Book not found or no longer available",
+            });
+        }
 
         res.status(200).send({
             message: "Book updated successfully",
             modifiedCount: result.modifiedCount,
         });
     } catch (error) {
+        console.error("Update book error:", error);
+
         res.status(500).send({
             message: "Failed to update book",
-            error: error.message,
         });
     }
 });
 
-// DELETE a book (Only book owner)
+// DELETE a book (Only book owner, no active borrows)
 app.delete("/books/:id", verifyToken, async (req, res) => {
     try {
         const { id } = req.params;
@@ -421,8 +508,10 @@ app.delete("/books/:id", verifyToken, async (req, res) => {
             });
         }
 
+        const bookId = new ObjectId(id);
+
         const existingBook = await books.findOne({
-            _id: new ObjectId(id),
+            _id: bookId,
         });
 
         if (!existingBook) {
@@ -440,24 +529,44 @@ app.delete("/books/:id", verifyToken, async (req, res) => {
             });
         }
 
-        const result = await books.deleteOne({
-            _id: new ObjectId(id),
+        const activeBorrow = await borrows.findOne({
+            bookId: id,
         });
+
+        if (activeBorrow) {
+            return res.status(409).send({
+                message: "This book cannot be deleted while it has active borrows",
+            });
+        }
+
+        const result = await books.deleteOne({
+            _id: bookId,
+            "addedBy.email": req.user.email,
+        });
+
+        if (result.deletedCount === 0) {
+            return res.status(404).send({
+                message: "Book not found",
+            });
+        }
 
         res.status(200).send({
             message: "Book deleted successfully",
             deletedCount: result.deletedCount,
         });
     } catch (error) {
+        console.error("Delete book error:", error);
+
         res.status(500).send({
             message: "Failed to delete book",
-            error: error.message,
         });
     }
 });
 
 // POST a borrow request (JWT protected)
 app.post("/borrows", verifyToken, async (req, res) => {
+    const session = client.startSession();
+
     try {
         const { bookId } = req.body;
 
@@ -467,77 +576,87 @@ app.post("/borrows", verifyToken, async (req, res) => {
             });
         }
 
-        const bookObjectId = new ObjectId(bookId);
         const borrowerEmail = req.user.email;
-
-        const book = await books.findOne({
-            _id: bookObjectId,
-        });
-
-        if (!book) {
-            return res.status(404).send({
-                message: "Book not found",
-            });
-        }
+        const bookObjectId = new ObjectId(bookId);
 
         const borrowedAt = new Date();
         const returnDate = new Date(
             borrowedAt.getTime() + 7 * 24 * 60 * 60 * 1000,
         );
 
-        const borrowRecord = {
-            bookId,
-            title: book.title,
-            author: book.author,
-            image: book.image || "",
-            borrowerName: req.user.name,
-            borrowerEmail,
-            borrowedAt,
-            returnDate,
-        };
+        let insertedId;
 
-        let borrowResult;
+        await session.withTransaction(async () => {
+            const book = await books.findOne(
+                { _id: bookObjectId },
+                { session },
+            );
 
-        try {
-            borrowResult = await borrows.insertOne(borrowRecord);
-        } catch (error) {
-            if (error.code === 11000) {
-                return res.status(409).send({
-                    message: "You have already borrowed this book",
-                });
+            if (!book) {
+                throw createError("Book not found", 404);
             }
-            throw error;
-        }
 
-        const updateResult = await books.updateOne(
-            {
-                _id: bookObjectId,
-                availableCopies: { $gt: 0 },
-            },
-            {
-                $inc: { availableCopies: -1 },
-            },
-        );
+            const borrowRecord = {
+                bookId,
+                title: book.title,
+                author: book.author,
+                image: book.image || "",
+                borrowerName: req.user.name,
+                borrowerEmail,
+                borrowedAt,
+                returnDate,
+            };
 
-        if (updateResult.modifiedCount === 0) {
-            await borrows.deleteOne({
-                _id: borrowResult.insertedId,
-            });
+            const updateResult = await books.updateOne(
+                {
+                    _id: bookObjectId,
+                    availableCopies: { $gt: 0 },
+                },
+                {
+                    $inc: { availableCopies: -1 },
+                },
+                { session },
+            );
 
-            return res.status(400).send({
-                message: "No copies are currently available",
-            });
-        }
+            if (updateResult.modifiedCount === 0) {
+                throw createError(
+                    "No copies are currently available",
+                    400,
+                );
+            }
+
+            const borrowResult = await borrows.insertOne(
+                borrowRecord,
+                { session },
+            );
+
+            insertedId = borrowResult.insertedId;
+        });
 
         res.status(201).send({
             message: "Book borrowed successfully",
-            insertedId: borrowResult.insertedId,
+            insertedId,
         });
     } catch (error) {
+        if (error.code === 11000) {
+            return res.status(409).send({
+                message: "You have already borrowed this book",
+            });
+        }
+
+        if (error.statusCode) {
+            return res.status(error.statusCode).send({
+                message: error.message,
+            });
+        }
+
+        console.error("Borrow book error:", error);
+
         res.status(500).send({
             message: "Failed to borrow book",
-            error: error.message,
         });
+    } finally {
+        await session.endSession();
     }
 });
 
@@ -553,15 +672,18 @@ app.get("/borrows", verifyToken, async (req, res) => {
 
         res.status(200).send(borrowedBooks);
     } catch (error) {
+        console.error("Get borrowed books error:", error);
+
         res.status(500).send({
             message: "Failed to get borrowed books",
-            error: error.message,
         });
     }
 });
 
 // DELETE a borrow record / Return Book (Only borrower)
 app.delete("/borrows/:id", verifyToken, async (req, res) => {
+    const session = client.startSession();
+
     try {
         const { id } = req.params;
 
@@ -571,54 +693,99 @@ app.delete("/borrows/:id", verifyToken, async (req, res) => {
             });
         }
 
-        const borrowRecord = await borrows.findOne({
-            _id: new ObjectId(id),
+        const borrowObjectId = new ObjectId(id);
+
+        await session.withTransaction(async () => {
+            const borrowRecord = await borrows.findOne(
+                { _id: borrowObjectId },
+                { session },
+            );
+
+            if (!borrowRecord) {
+                throw createError("Borrow record not found", 404);
+            }
+
+            if (
+                borrowRecord.borrowerEmail?.toLowerCase() !==
+                req.user.email
+            ) {
+                throw createError(
+                    "You are not allowed to return this book",
+                    403,
+                );
+            }
+
+            const deleteResult = await borrows.deleteOne(
+                {
+                    _id: borrowObjectId,
+                    borrowerEmail: req.user.email,
+                },
+                { session },
+            );
+
+            if (deleteResult.deletedCount === 0) {
+                throw createError("Borrow record not found", 404);
+            }
+
+            await books.updateOne(
+                {
+                    _id: new ObjectId(borrowRecord.bookId),
+                },
+                {
+                    $inc: { availableCopies: 1 },
+                },
+                { session },
+            );
         });
-
-        if (!borrowRecord) {
-            return res.status(404).send({
-                message: "Borrow record not found",
-            });
-        }
-
-        if (
-            borrowRecord.borrowerEmail?.toLowerCase() !==
-            req.user.email
-        ) {
-            return res.status(403).send({
-                message: "You are not allowed to return this book",
-            });
-        }
-
-        const deleteResult = await borrows.deleteOne({
-            _id: new ObjectId(id),
-            borrowerEmail: req.user.email,
-        });
-
-        if (deleteResult.deletedCount === 0) {
-            return res.status(404).send({
-                message: "Borrow record not found",
-            });
-        }
-
-        await books.updateOne(
-            {
-                _id: new ObjectId(borrowRecord.bookId),
-            },
-            {
-                $inc: { availableCopies: 1 },
-            },
-        );
 
         res.status(200).send({
             message: "Book returned successfully",
         });
     } catch (error) {
+        if (error.statusCode) {
+            return res.status(error.statusCode).send({
+                message: error.message,
+            });
+        }
+
+        console.error("Return book error:", error);
+
         res.status(500).send({
             message: "Failed to return book",
-            error: error.message,
+        });
+    } finally {
+        await session.endSession();
+    }
+});
+
+// Multer and general error handling
+app.use((error, req, res, next) => {
+    console.error("Server error:", error);
+
+    if (error instanceof multer.MulterError) {
+        return res.status(400).send({
+            message:
+                error.code === "LIMIT_FILE_SIZE"
+                    ? "Image size cannot exceed 5MB"
+                    : "Image upload error",
         });
     }
+
+    if (error.message === "Only image files are allowed") {
+        return res.status(400).send({
+            message: error.message,
+        });
+    }
+
+    if (error.message === "Not allowed by CORS") {
+        return res.status(403).send({
+            message: "Origin not allowed",
+        });
+    }
+
+    res.status(500).send({
+        message: "Something went wrong on the server",
+    });
 });
 
 // Start server
