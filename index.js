@@ -792,3 +792,5 @@ app.use((error, req, res, next) => {
 app.listen(PORT, () => {
     console.log(`Simple CRUD server is running on port ${PORT}`);
 });
+
+export default app
